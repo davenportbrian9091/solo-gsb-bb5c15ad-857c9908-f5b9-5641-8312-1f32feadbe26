@@ -390,3 +390,77 @@ class PublicationOut(BaseModel):
         description="该版本全体有打卡记录选手的完整分段结果（按选手号排序）；"
         "未完赛选手同样保留 pending 分段",
     )
+
+
+class CutoffsCreate(BaseModel):
+    """关门线试算请求：第 2 站至终点各站相对第 1 站出发的截止秒数。
+
+    数量须恰好等于版本站点数 - 1、逐站严格递增；这些约束在服务层
+    （版本快照读出后）校验，非法时返回 422。
+    """
+
+    cutoff_seconds: list[int] = Field(
+        ...,
+        description="第 2 站…第 N 站相对第 1 站出发的截止秒数，按站点顺序排列；"
+        "数量须等于版本站点数 - 1 且逐站严格递增",
+    )
+
+
+class CutoffStationOut(BaseModel):
+    """单站的关门判定结果（仅第 2 站至终点）。"""
+
+    station_seq: int = Field(..., description="站点序号（从 2 开始）")
+    cutoff_seconds: int = Field(
+        ..., description="本站相对第 1 站出发的截止秒数（回显请求值）"
+    )
+    verdict: Literal["pass", "overtime", "closed", "unknown"] = Field(
+        ...,
+        description="pass=在截止时间内（恰在截止也算通过）；overtime=首次超时，"
+        "记录为关门站；closed=此前已关门，后续一律已关门；unknown=无法判定",
+    )
+    event_no: Optional[str] = Field(
+        default=None, description="本站入选打卡的事件号（取自版本快照）；无打卡时为 null"
+    )
+    cumulative_seconds: Optional[int] = Field(
+        default=None,
+        description="累计到站秒数 = 本站入选打卡时间 - 第 1 站入选打卡时间；"
+        "无打卡或此前遇到待定分段时为 null",
+    )
+    reason: Optional[str] = Field(
+        default=None,
+        description="超时秒数 / 已关门 / 无法判定原因；通过且可判定时为 null",
+    )
+
+
+class CutoffRunnerOut(BaseModel):
+    """单个选手的关门线试算结果，全部数据来自同一个已发布版本快照。"""
+
+    runner_id: str
+    status: Literal["racing", "closed", "unknown"] = Field(
+        ...,
+        description="racing=各站均在关门线内（完赛或尚未到站）；"
+        "closed=已在某站首次超时关门；unknown=无法判定"
+        "（第 1 站缺打卡，或尚未关门时遇到待定分段）",
+    )
+    cutoff_station: Optional[int] = Field(
+        default=None,
+        description="首次超时的关门站序号；未关门（含无法判定）时为 null",
+    )
+    stations: list[CutoffStationOut] = Field(
+        ..., description="逐站判定，按站点升序（站点 2 … N）"
+    )
+
+
+class CutoffsOut(BaseModel):
+    """关门线试算结果：纯试算不写库，只读指定版本快照，实时打卡变化不影响结果。"""
+
+    version: int = Field(..., description="试算所依据的已发布版本号")
+    station_count: int = Field(..., description="该版本的赛道站点总数")
+    cutoff_seconds: list[int] = Field(
+        ..., description="回显请求的各站截止秒数（站点 2 … N）"
+    )
+    runners: list[CutoffRunnerOut] = Field(
+        ...,
+        description="版本内全体选手的试算结果（按选手号排序）；"
+        "关门一旦发生，后续站点一律标记已关门，不因后来赶上而恢复",
+    )

@@ -16,6 +16,8 @@ from .models import (
     CheckinCreate,
     CheckinOut,
     CorrectionPreview,
+    CutoffsCreate,
+    CutoffsOut,
     NeutralizedCreate,
     NeutralizedOut,
     PreviewCorrectionOut,
@@ -41,7 +43,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="越野赛分段计时 API",
-    version="1.6.0",
+    version="1.7.0",
     description=(
         "接收带唯一事件号的打卡，支持按事件号更正 / 撤销、批量登记（同一事务，"
         "任一失败整体回滚），并可预演更正（整体回滚）；"
@@ -52,7 +54,10 @@ app = FastAPI(
         "支持设备时钟校准试算：按站点校准窗偏移打卡时间后重选重算，纯试算不写库；"
         "支持发布不可变成绩版本（同一事务整版原子快照）并按版本 / 最新版查询；"
         "支持基于已发布版本快照的接力队成绩核算：按赛段顺序提交选手号，"
-        "逐棒取用时与交接等待，只读版本快照、不读实时成绩。"
+        "逐棒取用时与交接等待，只读版本快照、不读实时成绩；"
+        "支持基于已发布版本快照的关门线试算：提交第 2 站至终点各站相对"
+        "第 1 站出发的截止秒数，逐站比较累计到站秒数，首次超时即关门、"
+        "后续站点一律已关门，只读版本快照、纯试算不写库。"
     ),
     lifespan=lifespan,
 )
@@ -220,6 +225,19 @@ def get_publication(
     version: int, conn: sqlite3.Connection = Depends(get_db)
 ) -> PublicationOut:
     return service.get_publication(conn, version)
+
+
+@app.post(
+    "/api/publications/{version}/cutoffs",
+    response_model=CutoffsOut,
+    summary="关门线试算：基于指定版本快照，按各站截止秒数逐站判定关门（纯试算，不写库）",
+)
+def post_publication_cutoffs(
+    version: int,
+    payload: CutoffsCreate,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> CutoffsOut:
+    return service.compute_cutoffs(conn, version, payload)
 
 
 @app.post(

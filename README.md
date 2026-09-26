@@ -27,6 +27,11 @@
   （**不读实时成绩**），逐棒返回用时与交接等待；选手不在版本内、负责分段 `pending` 或交接站
   下一棒出发早于上一棒到达时队伍待定（空总用时、逐棒原因），否则给出队伍总用时
   （首棒起点至末棒终点 = 各棒用时 + 全部等待）；
+- 支持**关门线试算**：提交第 2 站至终点各站相对第 1 站出发的截止秒数（数量 = 版本站点数 - 1
+  且逐站严格递增），从**指定版本快照**逐选手按站点顺序比较累计到站秒数——恰在截止算通过，
+  首次超时记录关门站、其后各站一律已关门（不因后来赶上而恢复）；第 1 站缺打卡或尚未关门时
+  遇到待定分段时该站及其后各站无法判定（不用后续打卡推测）；版本不存在 `404`、规则不合法
+  `422`；**只读快照、纯试算不写库**；
 - 提供选手分段结果查询。
 
 ## 启动
@@ -69,6 +74,7 @@ Compose 通过命名卷 `timing-data` 持久化数据；删除卷（`docker comp
 | `GET` | `/api/publications/{version}` | 按版本号查询该版本完整成绩（不存在返回 404） |
 | `GET` | `/api/publications/latest` | 查询最新发布版本完整成绩（尚未发布时返回 404） |
 | `POST` | `/api/relay-teams` | 接力队成绩核算：基于已发布版本快照，按赛段顺序的选手号逐棒核算用时与交接等待（只读快照） |
+| `POST` | `/api/publications/{version}/cutoffs` | 关门线试算：基于指定版本快照，提交各站截止秒数逐站判定关门（只读快照、纯试算不写库；版本不存在 404、规则不合法 422） |
 
 ### 示例
 
@@ -514,6 +520,88 @@ curl -X POST http://localhost:8000/api/relay-teams \
 }
 ```
 
+## 关门线试算
+
+赛事方可在**已发布成绩版本**上试算关门线：提交**第 2 站至终点各站相对第 1 站出发的截止秒数**
+（按站点顺序，数量须等于版本站点数 − 1，且**逐站严格递增**）。试算**只读指定版本的快照**
+（`publication_entries`），完全不读取 `checkins` 实时表、**不写库**，因此发布后的实时打卡变化
+不影响同版本结果，重复请求结果稳定。版本不存在返回 `404`，截止秒数数量不符或不严格递增返回 `422`。
+
+判定规则（逐选手、按站点顺序）：
+
+- 累计到站秒数 = 本站入选打卡时间 − 第 1 站入选打卡时间（沿快照中的连续有效分段累计）；
+- 累计秒数 **<=** 本站截止秒数为 `pass`——**恰在截止时间也算通过**；
+- 首次累计 **>** 截止秒数为 `overtime`，该站记为选手的**首次关门站**，此后各站一律标记
+  `closed`（已关门），**即使后续打卡重新赶上也不恢复**，已关门各站不再给出累计秒数；
+- **第 1 站缺少入选打卡**时，各站一律 `unknown`（无法判定，缺少累计基准）；
+- **尚未关门时**遇到快照中的待定分段（缺站或时间倒退），该到站站及其后各站一律 `unknown`，
+  **不用后续打卡推测**；已关门之后再遇缺站 / 待定，仍保持 `closed`；
+- 选手最终状态：`racing`（各站均在关门线内，含尚未到站）、`closed`（已关门）、
+  `unknown`（无法判定）。
+
+以种子数据（6 站）为例，R001 于 08:00 出发、各站累计 32 / 72 / 115 / 165 / 210 分钟：
+
+```bash
+curl -X POST http://localhost:8000/api/publications/1/cutoffs \
+  -H 'Content-Type: application/json' \
+  -d '{"cutoff_seconds": [2000, 4500, 7000, 10000, 13000]}'
+```
+
+响应（`cutoff_seconds` 依次对应站点 2…6；下例中 R001 全部通过、R003 在第 4 站起因缺站无法判定）：
+
+```json
+{
+  "version": 1,
+  "station_count": 6,
+  "cutoff_seconds": [2000, 4500, 7000, 10000, 13000],
+  "runners": [
+    {
+      "runner_id": "R001",
+      "status": "racing",
+      "cutoff_station": null,
+      "stations": [
+        {"station_seq": 2, "cutoff_seconds": 2000, "verdict": "pass",
+         "event_no": "S-R001-2", "cumulative_seconds": 1920, "reason": null},
+        {"station_seq": 3, "cutoff_seconds": 4500, "verdict": "pass",
+         "event_no": "S-R001-3", "cumulative_seconds": 4320, "reason": null}
+      ]
+    },
+    {
+      "runner_id": "R003",
+      "status": "unknown",
+      "cutoff_station": null,
+      "stations": [
+        {"station_seq": 4, "cutoff_seconds": 7000, "verdict": "unknown",
+         "event_no": null, "cumulative_seconds": null,
+         "reason": "分段 3→4 待定：站点 4 缺少有效打卡"},
+        {"station_seq": 5, "cutoff_seconds": 10000, "verdict": "unknown",
+         "event_no": "S-R003-5", "cumulative_seconds": null,
+         "reason": "此前分段待定，无法累计到站秒数"}
+      ]
+    }
+  ]
+}
+```
+
+首次超时的选手 `status` 为 `closed`、`cutoff_station` 给出关门站；超时站本身给出
+`cumulative_seconds` 与超时秒数，例如截止 1900 秒而累计 1920 秒：
+
+```json
+{
+  "runner_id": "R001",
+  "status": "closed",
+  "cutoff_station": 2,
+  "stations": [
+    {"station_seq": 2, "cutoff_seconds": 1900, "verdict": "overtime",
+     "event_no": "S-R001-2", "cumulative_seconds": 1920,
+     "reason": "累计 1920 秒超过截止 1900 秒，超时 20 秒"},
+    {"station_seq": 3, "cutoff_seconds": 99999, "verdict": "closed",
+     "event_no": "S-R001-3", "cumulative_seconds": null,
+     "reason": "已在站点 2 关门，后续站点一律视为已关门"}
+  ]
+}
+```
+
 ## 本地开发
 
 ```bash
@@ -554,3 +642,10 @@ pytest                               # 运行测试
   交接等待 = 下一棒起点入选时间 − 上一棒终点入选时间，出发早于到达时双方标记待定、不给用时
   与等待；总用时由"各棒用时 + 全部等待"求和（与首棒起点至末棒终点的时间跨度恒等，代码内置
   断言保证），任一一棒待定时总用时为 `null`。
+- 关门线试算先按版本号加载整版快照（不存在 `404`，版本校验先于规则校验），再校验截止秒数
+  数量 = 快照 `station_count - 1` 且逐站严格递增（`422`）；判定在快照内每个选手的 `SplitsOut`
+  上用"比赛中 / 已关门 / 无法判定"三态状态机按站点顺序推进：累计秒数沿连续的有效分段累加，
+  `累计 <= 截止` 为通过（恰在截止算通过），首次超时记为关门站，其后各站一律已关门且不再
+  给出累计秒数（后来赶上不恢复）；第 1 站缺打卡或尚未关门时遇到待定分段，该站及其后各站
+  一律无法判定、不用后续打卡推测。全程只读 `publication_entries` 快照、不写任何数据，
+  不读 `checkins` 实时表，因此实时打卡变化不影响同版本试算结果。
