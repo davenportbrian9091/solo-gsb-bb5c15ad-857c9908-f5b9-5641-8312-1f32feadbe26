@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field
 
 
 class CheckinCreate(BaseModel):
@@ -389,4 +389,87 @@ class PublicationOut(BaseModel):
         ...,
         description="该版本全体有打卡记录选手的完整分段结果（按选手号排序）；"
         "未完赛选手同样保留 pending 分段",
+    )
+
+
+class CutoffsCreate(BaseModel):
+    """关门线试算请求：第 2 站至终点各站相对第 1 站出发的截止秒数。
+
+    数量须等于版本站点数 - 1 且逐站严格递增；这些约束在服务层
+    （版本快照读出后）校验，非法时返回 422，版本不存在时返回 404。
+    字段可写作 cutoff_seconds 或简称 cutoffs。
+    """
+
+    cutoff_seconds: list[int] = Field(
+        ...,
+        validation_alias=AliasChoices("cutoff_seconds", "cutoffs"),
+        description="第 2 站 … 第 N 站的关门截止秒数（相对第 1 站出发），"
+        "按站点顺序逐站严格递增",
+    )
+
+
+class CutoffStationOut(BaseModel):
+    """单个站点的关门线试算判定。"""
+
+    station_seq: int
+    cutoff_seconds: Optional[int] = Field(
+        default=None,
+        description="本站关门截止秒数（相对第 1 站出发）；第 1 站恒为 0（出发基准）",
+    )
+    status: Literal["pass", "over", "closed", "unknown"] = Field(
+        ...,
+        description=(
+            "pass=在关门时间前（含恰在截止时刻）通过；"
+            "over=本站首次超时（关门站）；"
+            "closed=此前已关门，本站一律标记已关门；"
+            "unknown=无法判定（第 1 站缺打卡，或未关门时遇到待定分段，本站及后续站点）"
+        ),
+    )
+    cumulative_seconds: Optional[int] = Field(
+        default=None,
+        description="累计到站秒数 = 本站入选打卡 - 第 1 站出发；恰在截止时刻算通过；"
+        "已关门 / 无法判定或缺少入选打卡时为 null",
+    )
+    cumulative: Optional[str] = Field(
+        default=None, description="累计到站用时，H:MM:SS；无法给出时为 null"
+    )
+    reason: Optional[str] = Field(
+        default=None,
+        description="首次超时 / 已关门 / 无法判定的原因；正常通过时为 null",
+    )
+
+
+class CutoffRunnerOut(BaseModel):
+    """单名选手的关门线试算结果。"""
+
+    runner_id: str
+    status: Literal["finished", "closed", "unknown"] = Field(
+        ...,
+        description=(
+            "finished=各站均在关门时间内（含恰在截止时刻）完成；"
+            "closed=有关门站（此后站点一律已关门，不因后来赶上而恢复）；"
+            "unknown=无法判定（第 1 站缺打卡，或未关门时遇到待定分段）"
+        ),
+    )
+    first_closed_station: Optional[int] = Field(
+        default=None,
+        description="首次超时的关门站序号；完赛或无法判定时为 null",
+    )
+    stations: list[CutoffStationOut] = Field(
+        ..., description="逐站判定（第 1 站至终点，按站点升序）"
+    )
+
+
+class CutoffsOut(BaseModel):
+    """关门线试算结果：全部数据来自同一个已发布版本快照，纯试算不写库。"""
+
+    version: int = Field(..., description="试算所依据的已发布版本号")
+    station_count: int = Field(..., description="该版本的赛道站点总数")
+    cutoff_seconds: list[int] = Field(
+        ...,
+        description="回显请求的第 2 站 … 第 N 站关门截止秒数（相对第 1 站出发）",
+    )
+    runners: list[CutoffRunnerOut] = Field(
+        ...,
+        description="该版本全体有打卡记录选手的试算结果（按选手号排序）",
     )

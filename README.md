@@ -27,6 +27,11 @@
   （**不读实时成绩**），逐棒返回用时与交接等待；选手不在版本内、负责分段 `pending` 或交接站
   下一棒出发早于上一棒到达时队伍待定（空总用时、逐棒原因），否则给出队伍总用时
   （首棒起点至末棒终点 = 各棒用时 + 全部等待）；
+- 支持**关门线试算**：提交已发布版本号与第 2 站至终点各站相对第 1 站出发的**截止秒数**
+  （数量 = 版本站点数 - 1、逐站严格递增），从**同一版本快照**读取入选打卡与分段
+  （**不读实时成绩**），按选手号返回最终状态、首次关门站及逐站判定与累计秒数；
+  恰在截止时刻算通过，首次超时后各站一律已关门、不因后来赶上而恢复；第 1 站缺打卡或
+  尚未关门时遇到待定分段则该站及后续站点无法判定；纯试算**不写库**；
 - 提供选手分段结果查询。
 
 ## 启动
@@ -68,6 +73,7 @@ Compose 通过命名卷 `timing-data` 持久化数据；删除卷（`docker comp
 | `POST` | `/api/publications` | 发布成绩版本：同一事务读取当前打卡、整版快照原子保存，返回新版本完整成绩 |
 | `GET` | `/api/publications/{version}` | 按版本号查询该版本完整成绩（不存在返回 404） |
 | `GET` | `/api/publications/latest` | 查询最新发布版本完整成绩（尚未发布时返回 404） |
+| `POST` | `/api/publications/{version}/cutoffs` | 关门线试算：基于版本快照逐选手评估各站关门状态与累计秒数（只读快照，不写库） |
 | `POST` | `/api/relay-teams` | 接力队成绩核算：基于已发布版本快照，按赛段顺序的选手号逐棒核算用时与交接等待（只读快照） |
 
 ### 示例
@@ -514,6 +520,92 @@ curl -X POST http://localhost:8000/api/relay-teams \
 }
 ```
 
+## 关门线试算
+
+赛事方在设定 / 调整各站关门时间时，可提交**已发布成绩版本号**与**第 2 站至终点各站
+相对第 1 站出发的截止秒数**，试算每个选手会在哪一站关门。试算**只读指定版本的快照**
+（`publication_entries`），完全不读取 `checkins` 实时表、也不写入任何数据，因此发布后的
+打卡 / 更正 / 撤销不影响同版本的试算结果（与接力核算一样，结果只随版本变化）。
+
+请求字段为 `cutoff_seconds`（也接受简称 `cutoffs`）：数组按站点顺序给出第 2 站、第 3 站
+…… 第 N 站的截止秒数，数量须恰好等于**该版本站点数 - 1**，且**逐站严格递增**（相邻相等
+也拒绝），否则返回 `422`；指定版本不存在返回 `404`（版本校验先于截止秒数校验）。
+
+```bash
+curl -X POST http://localhost:8000/api/publications/1/cutoffs \
+  -H 'Content-Type: application/json' \
+  -d '{"cutoff_seconds": [2000, 4400, 7000, 10000, 13000]}'
+```
+
+规则：
+
+- 逐选手按站点顺序比较**累计到站秒数**（本站入选打卡时间 − 第 1 站入选打卡时间），
+  累计秒数 **<= 截止秒数算通过，恰在截止时刻也算通过**；累计秒数 > 截止秒数为**首次超时**，
+  该站记为关门站（`over`）并记录为选手的 `first_closed_station`；
+- 首次关门后，**后续站点一律标记已关门**（`closed`），即使后续打卡重新落在关门线内
+  （后来赶上）也**不恢复**，且关门后各站不再给出累计秒数；
+- **第 1 站缺打卡**（无出发基准）时，该选手第 1 站及后续站点全部标记无法判定（`unknown`），
+  不使用其后续打卡推测；
+- **尚未关门**时遇到**待定分段**（缺站或时间倒退，原因沿用快照），该分段到站及后续站点
+  全部标记 `unknown`，不用后续打卡反推累计秒数；一旦已经关门，之后的缺站 / 时间倒退只标记
+  `closed`，不再转为无法判定；
+- 按选手号返回版本内**全体有打卡记录选手**的最终状态（`finished` 各站均在关门线内 /
+  `closed` 有关门站 / `unknown` 无法判定）、首次关门站及第 1 站至终点的逐站判定
+  （状态、该站截止秒数、累计秒数与 H:MM:SS、原因）；
+- **纯试算**：不写入数据库，不改变实时成绩与已发布版本，重复请求结果稳定。
+
+响应节选（种子版本 v1，截止秒数 `[2000, 4400, 7000, 10000, 13000]`：
+R001 全程在关门线内完赛；R002 第 2 站 2400 秒超过截止 2000 秒，首次关门后各站均已关门；
+R003 在关门线内通过前 3 站后，因缺第 4 站（分段待定）第 4 站起无法判定）：
+
+```json
+{
+  "version": 1,
+  "station_count": 6,
+  "cutoff_seconds": [2000, 4400, 7000, 10000, 13000],
+  "runners": [
+    {
+      "runner_id": "R001",
+      "status": "finished",
+      "first_closed_station": null,
+      "stations": [
+        {"station_seq": 1, "cutoff_seconds": 0, "status": "pass",
+         "cumulative_seconds": 0, "cumulative": "0:00:00", "reason": null},
+        {"station_seq": 2, "cutoff_seconds": 2000, "status": "pass",
+         "cumulative_seconds": 1920, "cumulative": "0:32:00", "reason": null},
+        {"station_seq": 3, "cutoff_seconds": 4400, "status": "pass",
+         "cumulative_seconds": 4320, "cumulative": "1:12:00", "reason": null}
+      ]
+    },
+    {
+      "runner_id": "R002",
+      "status": "closed",
+      "first_closed_station": 2,
+      "stations": [
+        {"station_seq": 1, "cutoff_seconds": 0, "status": "pass",
+         "cumulative_seconds": 0, "cumulative": "0:00:00", "reason": null},
+        {"station_seq": 2, "cutoff_seconds": 2000, "status": "over",
+         "cumulative_seconds": 2400, "cumulative": "0:40:00",
+         "reason": "累计到站 0:40:00（2400 秒）超过关门截止 0:33:20（2000 秒），首次超时"},
+        {"station_seq": 3, "cutoff_seconds": 4400, "status": "closed",
+         "cumulative_seconds": null, "cumulative": null,
+         "reason": "已在第 2 站关门（首次超过关门截止时间），后续站点一律标记已关门"}
+      ]
+    },
+    {
+      "runner_id": "R003",
+      "status": "unknown",
+      "first_closed_station": null,
+      "stations": [
+        {"station_seq": 4, "cutoff_seconds": 7000, "status": "unknown",
+         "cumulative_seconds": null, "cumulative": null,
+         "reason": "尚未关门时分段 3→4 待定（站点 4 缺少有效打卡），本站及后续站点无法判定"}
+      ]
+    }
+  ]
+}
+```
+
 ## 本地开发
 
 ```bash
@@ -554,3 +646,10 @@ pytest                               # 运行测试
   交接等待 = 下一棒起点入选时间 − 上一棒终点入选时间，出发早于到达时双方标记待定、不给用时
   与等待；总用时由"各棒用时 + 全部等待"求和（与首棒起点至末棒终点的时间跨度恒等，代码内置
   断言保证），任一一棒待定时总用时为 `null`。
+- 关门线试算先按版本号加载整版快照（不存在 `404`），再校验截止秒数数量 = 快照
+  `station_count - 1` 且逐站严格递增（`422`）；各选手的入选打卡与分段状态全部取自该选手在
+  快照中的 `SplitsOut`，全程不读 `checkins` 实时表，因此同版本结果不受实时打卡变化影响。
+  判定为按站点顺序的三态扫描：尚未关门时分段 `pending`（缺站 / 时间倒退）则该站起 `unknown`
+  且不用后续打卡推测；累计到站秒数 > 本站截止秒数的首站记 `over`，此后各站一律 `closed`、
+  不给出累计秒数，后来赶上也不恢复；`<=`（含恰在截止时刻）为 `pass`。第 1 站缺打卡时无出发
+  基准，该选手全程 `unknown`。试算只读不写，不产生新版本。

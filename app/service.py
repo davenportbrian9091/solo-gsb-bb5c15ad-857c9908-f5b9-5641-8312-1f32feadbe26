@@ -22,6 +22,10 @@ from .models import (
     CheckinOut,
     CheckinSelection,
     CorrectionPreview,
+    CutoffRunnerOut,
+    CutoffStationOut,
+    CutoffsCreate,
+    CutoffsOut,
     NeutralWindow,
     NeutralizedCreate,
     NeutralizedOut,
@@ -1037,4 +1041,203 @@ def compute_relay_team(conn: sqlite3.Connection, payload: RelayTeamCreate) -> Re
         total=_fmt_duration(total_seconds) if total_seconds is not None else None,
         legs=leg_outs,
         handovers=handover_outs,
+    )
+
+
+# ---------- 关门线试算 ----------
+
+
+def compute_cutoffs(
+    conn: sqlite3.Connection, version: int, payload: CutoffsCreate
+) -> CutoffsOut:
+    """关门线试算：基于已发布版本快照逐选手评估各站是否在关门时间内。
+
+    - 截止秒数为第 2 站 … 第 N 站相对第 1 站出发的时间：数量须等于版本
+      站点数 - 1 且逐站严格递增（相等不允许），否则 422；版本不存在 404
+      （版本校验先于截止秒数校验）；
+    - 只读指定版本快照（publication_entries），不读 checkins 实时表，
+      不写入任何数据，因此发布后的打卡 / 更正 / 撤销不影响试算结果；
+    - 逐选手按站点顺序比较累计到站秒数（本站入选打卡 - 第 1 站入选打卡），
+      累计秒数 <= 截止秒数算通过，恰在截止时刻也算通过；首次 > 截止的
+      站点记为关门站（over），此后所有站点一律标记已关门（closed），
+      即使后续打卡在截止时间内（后来赶上）也不恢复；
+    - 第 1 站缺少入选打卡时该选手全程无法判定：第 1 站及后续站点均为
+      unknown；尚未关门时遇到待定（pending）分段（缺站或时间倒退），
+      该段到站及后续站点均为 unknown，不用后续打卡推测累计秒数；
+    - 关门站一旦确定即"已关门"，此后即便出现缺站 / 时间倒退等待定情形
+      也只标记 closed，不再转为 unknown（无法判定只发生在尚未关门时）。
+    """
+    pub = _load_publication(conn, version)
+    if pub is None:
+        raise HTTPException(status_code=404, detail=f"成绩版本 {version} 不存在")
+
+    cutoffs = payload.cutoff_seconds
+    expected = pub.station_count - 1
+    if len(cutoffs) != expected:
+        raise HTTPException(
+            status_code=422,
+            detail=f"截止秒数数量 {len(cutoffs)} 不合法：版本 {version} 站点数为 "
+            f"{pub.station_count}，须提供第 2 站至终点共 {expected} 个截止秒数",
+        )
+    for i, (prev, cur) in enumerate(zip(cutoffs, cutoffs[1:]), start=1):
+        if cur <= prev:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"第 {i + 1} 站截止秒数 {cur} 不大于第 {i} 站截止秒数 {prev}："
+                    "各站截止秒数须逐站严格递增"
+                ),
+            )
+
+    runners = [_cutoffs_for_runner(splits, cutoffs) for splits in pub.results]
+    return CutoffsOut(
+        version=version,
+        station_count=pub.station_count,
+        cutoff_seconds=cutoffs,
+        runners=runners,
+    )
+
+
+def _cutoffs_for_runner(splits: SplitsOut, cutoffs: list[int]) -> CutoffRunnerOut:
+    """由版本快照中单选手的入选打卡与分段推导关门线逐站判定。
+
+    状态机（按站点 1..N 顺序扫描）：
+    - 第 1 站无入选打卡 -> 第 1 站起全部 unknown（无法判定，不推测）；
+    - 尚未关门时分段 k-1 -> k 为 pending（缺站 / 时间倒退）-> 第 k 站起
+      全部 unknown，即使第 k 站或之后存在入选打卡也不拿来推测；
+    - 累计到站秒数 <= 本站截止秒数为 pass（恰在截止时刻通过）；
+      首次超时站点为 over（关门站），此后各站一律 closed。
+    """
+    count = splits.station_count
+    station_times = {s.station_seq: s.occurred_at for s in splits.stations}
+    segment_by_to = {seg.to_station: seg for seg in splits.segments}
+
+    stations: list[CutoffStationOut] = []
+    start = station_times.get(1)
+    if start is None:
+        # 第 1 站缺打卡：无出发基准，第 1 站及后续站点一律无法判定
+        stations.append(
+            CutoffStationOut(
+                station_seq=1,
+                cutoff_seconds=0,
+                status="unknown",
+                reason="第 1 站缺少有效打卡，无出发基准，无法判定关门状态",
+            )
+        )
+        stations.extend(
+            CutoffStationOut(
+                station_seq=seq,
+                cutoff_seconds=cutoffs[seq - 2],
+                status="unknown",
+                reason="第 1 站缺少有效打卡，无法判定关门状态",
+            )
+            for seq in range(2, count + 1)
+        )
+        return CutoffRunnerOut(
+            runner_id=splits.runner_id,
+            status="unknown",
+            first_closed_station=None,
+            stations=stations,
+        )
+
+    stations.append(
+        CutoffStationOut(
+            station_seq=1,
+            cutoff_seconds=0,
+            status="pass",
+            cumulative_seconds=0,
+            cumulative="0:00:00",
+        )
+    )
+
+    state: str = "open"  # open=尚未关门；closed=已出现关门站；unknown=无法判定
+    first_closed_station: int | None = None
+    cumulative: int | None = 0
+    for seq in range(2, count + 1):
+        cutoff = cutoffs[seq - 2]
+        if state == "unknown":
+            stations.append(
+                CutoffStationOut(
+                    station_seq=seq,
+                    cutoff_seconds=cutoff,
+                    status="unknown",
+                    reason="此前存在待定分段，累计到站秒数无法判定",
+                )
+            )
+            continue
+        if state == "closed":
+            # 关门后不再恢复：后续站一律已关门，不用后来打卡重新评估
+            stations.append(
+                CutoffStationOut(
+                    station_seq=seq,
+                    cutoff_seconds=cutoff,
+                    status="closed",
+                    reason=(
+                        f"已在第 {first_closed_station} 站关门（首次超过关门截止时间），"
+                        "后续站点一律标记已关门"
+                    ),
+                )
+            )
+            continue
+
+        # state == open：检查进入本站的分段与本站累计到站秒数
+        seg = segment_by_to[seq]
+        if seg.status == "pending":
+            stations.append(
+                CutoffStationOut(
+                    station_seq=seq,
+                    cutoff_seconds=cutoff,
+                    status="unknown",
+                    reason=(
+                        f"尚未关门时分段 {seg.from_station}→{seg.to_station} 待定"
+                        f"（{seg.reason}），本站及后续站点无法判定"
+                    ),
+                )
+            )
+            state = "unknown"
+            cumulative = None
+            continue
+
+        t = station_times.get(seq)
+        cumulative = int((t - start).total_seconds())
+        if cumulative > cutoff:
+            stations.append(
+                CutoffStationOut(
+                    station_seq=seq,
+                    cutoff_seconds=cutoff,
+                    status="over",
+                    cumulative_seconds=cumulative,
+                    cumulative=_fmt_duration(cumulative),
+                    reason=(
+                        f"累计到站 {_fmt_duration(cumulative)}（{cumulative} 秒）超过"
+                        f"关门截止 {_fmt_duration(cutoff)}（{cutoff} 秒），首次超时"
+                    ),
+                )
+            )
+            state = "closed"
+            first_closed_station = seq
+            cumulative = None  # 关门后各站不再给出累计秒数
+        else:
+            stations.append(
+                CutoffStationOut(
+                    station_seq=seq,
+                    cutoff_seconds=cutoff,
+                    status="pass",
+                    cumulative_seconds=cumulative,
+                    cumulative=_fmt_duration(cumulative),
+                )
+            )
+
+    final_status = (
+        "finished"
+        if state == "open"
+        else "closed"
+        if state == "closed"
+        else "unknown"
+    )
+    return CutoffRunnerOut(
+        runner_id=splits.runner_id,
+        status=final_status,
+        first_closed_station=first_closed_station,
+        stations=stations,
     )
